@@ -6,7 +6,7 @@ import httpx
 # Esto carga las variables en local, en Render usará el panel de control
 load_dotenv()
 
-app = FastAPI(title="GeommaAI Gateway")
+app = FastAPI(title="GenommaAI Gateway")
 
 # Variables de entorno
 VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
