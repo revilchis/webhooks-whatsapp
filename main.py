@@ -49,6 +49,7 @@ load_dotenv()
 
 VERIFY_TOKEN: str = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 APP_SECRET: str = os.getenv("WHATSAPP_APP_SECRET", "")
+VALIDAR_FIRMA: bool = os.getenv("VALIDAR_FIRMA_HMAC", "true").lower() == "true"
 
 # Variables para enviar mensajes (actualmente no se usan, pero se cargan para futuro)
 PHONE_ID: str = os.getenv("WHATSAPP_PHONE_ID", "")
