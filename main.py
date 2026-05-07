@@ -1,29 +1,9 @@
-"""
-main.py — Webhook de validación para WhatsApp Business API (Meta Cloud API).
-
-Propósito: verificar la conexión con Meta y observar payloads reales antes
-           de implementar el webhook de producción.
-
-Endpoints:
-  GET  /webhook  — verificación del webhook (hub.challenge)
-  POST /webhook  — recepción de mensajes y eventos
-
-Uso local:
-  pip install -r requirements.txt
-  cp .env.example .env   # completar variables
-  uvicorn main:app --reload --port 8080
-
-Para exponer localmente (requiere cuenta gratuita en ngrok):
-  ngrok http 8080
-  # Copiar la URL https://xxxx.ngrok.io al panel de Meta Developers
-  # App > WhatsApp > Configuration > Webhook URL: https://xxxx.ngrok.io/webhook
-  # Verify Token: el valor de WHATSAPP_VERIFY_TOKEN en tu .env
-"""
 from __future__ import annotations
 
 import json
 import logging
 import os
+import requests  # <-- NUEVA IMPORTACIÓN
 from collections import deque
 from datetime import datetime
 
@@ -55,6 +35,11 @@ VALIDAR_FIRMA: bool = os.getenv("VALIDAR_FIRMA_HMAC", "true").lower() == "true"
 PHONE_ID: str = os.getenv("WHATSAPP_PHONE_ID", "")
 ACCESS_TOKEN: str = os.getenv("WHATSAPP_TOKEN", "")
 
+# <-- NUEVA VARIABLE DE ENTORNO / URL FIJA
+FORWARD_URL: str = os.getenv(
+    "FORWARD_URL", 
+    "https://trade.genesis.genommalab.com/api/v1/whatsapp/webhook"
+)
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -70,7 +55,6 @@ logger = logging.getLogger("wa_tester.main")
 app = FastAPI(title="WhatsApp Webhook Tester", version="1.0.0")
 
 # Deduplicación en memoria — evita procesar el mismo message_id dos veces
-# Meta puede reenviar el mismo evento si no respondemos 200 a tiempo
 _mensajes_vistos: deque[str] = deque(maxlen=500)
 
 # Registro de todos los eventos recibidos (en RAM, solo para validación)
@@ -83,15 +67,6 @@ _historial: list[dict] = []
 
 @app.get("/webhook", response_class=PlainTextResponse)
 async def verificar_webhook(request: Request) -> str:
-    """
-    Meta llama a este endpoint cuando configuras el webhook en el panel de
-    Meta Developers. Debes responder con hub.challenge si hub.verify_token coincide.
-
-    Parámetros que envía Meta (query string):
-      hub.mode         = "subscribe"
-      hub.verify_token = el token que configuraste en el panel
-      hub.challenge    = string aleatorio que debes devolver tal cual
-    """
     params = dict(request.query_params)
     mode = params.get("hub.mode")
     token = params.get("hub.verify_token")
@@ -113,14 +88,6 @@ async def verificar_webhook(request: Request) -> str:
 
 @app.post("/webhook")
 async def recibir_webhook(request: Request, background_tasks: BackgroundTasks) -> Response:
-    """
-    Meta envía aquí todos los eventos: mensajes entrantes, estados de entrega,
-    reacciones, etc.
-
-    IMPORTANTE: Meta requiere respuesta HTTP 200 en menos de 20 segundos.
-    Si no la recibe, reintentará el envío varias veces.
-    Por eso procesamos en BackgroundTask y respondemos 200 inmediatamente.
-    """
     body_bytes = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
 
@@ -140,12 +107,24 @@ async def recibir_webhook(request: Request, background_tasks: BackgroundTasks) -
 
     # Responder 200 inmediatamente y procesar en background
     background_tasks.add_task(_procesar_payload, payload)
+    background_tasks.add_task(_reenviar_payload, payload)  # <-- NUEVA TAREA
     return Response(status_code=200)
 
 
 # ---------------------------------------------------------------------------
 # Procesamiento en background
 # ---------------------------------------------------------------------------
+
+def _reenviar_payload(payload: dict) -> None:
+    """NUEVA FUNCIÓN: Reenvía el payload exacto a la API de Genesis."""
+    try:
+        headers = {"Content-Type": "application/json"}
+        # Se envía por POST con json=payload para preservar la estructura
+        response = requests.post(FORWARD_URL, json=payload, headers=headers, timeout=10)
+        response.raise_for_status()
+        logger.info("🚀 Payload reenviado a Genesis exitosamente (Status: %s)", response.status_code)
+    except requests.exceptions.RequestException as e:
+        logger.error("❌ Error al reenviar payload a Genesis: %s", e)
 
 def _procesar_payload(payload: dict) -> None:
     """Parsea y loggea todos los eventos del payload."""
@@ -173,14 +152,12 @@ def _procesar_payload(payload: dict) -> None:
             "evento": _evento_a_dict(evento),
         })
 
-
 def _extraer_message_id(evento) -> str | None:
     if isinstance(evento, (MensajeTexto, MensajeInteractivo)):
         return evento.message_id
     if isinstance(evento, ActualizacionEstado):
         return f"status:{evento.message_id}:{evento.estado}"
     return None
-
 
 def _evento_a_dict(evento) -> dict:
     if isinstance(evento, EventoDesconocido):
@@ -194,15 +171,10 @@ def _evento_a_dict(evento) -> dict:
 
 @app.get("/historial")
 async def ver_historial(limit: int = 20) -> dict:
-    """
-    Devuelve los últimos N eventos recibidos.
-    Solo para validación — no exponer en producción.
-    """
     return {
         "total": len(_historial),
         "ultimos": _historial[-limit:],
     }
-
 
 @app.get("/health")
 async def health() -> dict:
