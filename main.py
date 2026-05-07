@@ -1,89 +1,213 @@
-import os
-import httpx
+"""
+main.py — Webhook de validación para WhatsApp Business API (Meta Cloud API).
+
+Propósito: verificar la conexión con Meta y observar payloads reales antes
+           de implementar el webhook de producción.
+
+Endpoints:
+  GET  /webhook  — verificación del webhook (hub.challenge)
+  POST /webhook  — recepción de mensajes y eventos
+
+Uso local:
+  pip install -r requirements.txt
+  cp .env.example .env   # completar variables
+  uvicorn main:app --reload --port 8080
+
+Para exponer localmente (requiere cuenta gratuita en ngrok):
+  ngrok http 8080
+  # Copiar la URL https://xxxx.ngrok.io al panel de Meta Developers
+  # App > WhatsApp > Configuration > Webhook URL: https://xxxx.ngrok.io/webhook
+  # Verify Token: el valor de WHATSAPP_VERIFY_TOKEN en tu .env
+"""
+from __future__ import annotations
+
+import json
 import logging
-import uvicorn
-from pathlib import Path
+import os
+from collections import deque
+from datetime import datetime
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+from fastapi.responses import PlainTextResponse
 
-# IMPORTANTE: Aquí importas la lógica de tu IA, sea cual sea.
-# 'analizador' es tu archivo .py y 'procesar_mensaje' es tu función.
-try:
-    from analizador import procesar_mensaje 
-except ImportError:
-    async def procesar_mensaje(texto):
-        return "⚠️ Error: El motor de análisis no está conectado."
+from analizador import (
+    ActualizacionEstado,
+    EventoDesconocido,
+    MensajeInteractivo,
+    MensajeTexto,
+    loggear_evento,
+    parsear_payload,
+    validar_firma,
+)
 
-# CONFIGURACIÓN DE LOGS
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger("GeommaAI.Gateway")
+# ---------------------------------------------------------------------------
+# Configuración
+# ---------------------------------------------------------------------------
 
-def cargar_entorno():
-    load_dotenv() # Carga .env local si existe
-    logger.info("Entorno configurado.")
+load_dotenv()
 
-cargar_entorno()
+VERIFY_TOKEN: str = os.getenv("WHATSAPP_VERIFY_TOKEN", "mi_token_secreto")
+APP_SECRET: str = os.getenv("WHATSAPP_APP_SECRET", "")
+VALIDAR_FIRMA: bool = os.getenv("VALIDAR_FIRMA_HMAC", "true").lower() == "true"
 
-class WhatsAppGateway:
-    def __init__(self):
-        self.token = os.getenv("WHATSAPP_TOKEN")
-        self.phone_id = os.getenv("WHATSAPP_PHONE_ID")
-        self.verify_token = os.getenv("WHATSAPP_VERIFY_TOKEN")
-        self.base_url = f"https://graph.facebook.com/v21.0/{self.phone_id}/messages"
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("wa_tester.main")
 
-    async def enviar_texto(self, numero: str, texto: str):
-        headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": numero,
-            "type": "text",
-            "text": {"body": texto}
-        }
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(self.base_url, headers=headers, json=payload)
-                return response.json()
-            except Exception as e:
-                logger.error(f"❌ Error WhatsApp: {e}")
-                return None
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 
-app = FastAPI()
-gw = WhatsAppGateway()
+app = FastAPI(title="WhatsApp Webhook Tester", version="1.0.0")
 
-@app.get("/webhook")
-async def verificar(request: Request):
-    params = request.query_params
-    if params.get("hub.verify_token") == gw.verify_token:
-        return Response(content=params.get("hub.challenge"), media_type="text/plain")
-    return Response(status_code=403)
+# Deduplicación en memoria — evita procesar el mismo message_id dos veces
+# Meta puede reenviar el mismo evento si no respondemos 200 a tiempo
+_mensajes_vistos: deque[str] = deque(maxlen=500)
+
+# Registro de todos los eventos recibidos (en RAM, solo para validación)
+_historial: list[dict] = []
+
+
+# ---------------------------------------------------------------------------
+# GET /webhook — Verificación de Meta
+# ---------------------------------------------------------------------------
+
+@app.get("/webhook", response_class=PlainTextResponse)
+async def verificar_webhook(request: Request) -> str:
+    """
+    Meta llama a este endpoint cuando configuras el webhook en el panel de
+    Meta Developers. Debes responder con hub.challenge si hub.verify_token coincide.
+
+    Parámetros que envía Meta (query string):
+      hub.mode         = "subscribe"
+      hub.verify_token = el token que configuraste en el panel
+      hub.challenge    = string aleatorio que debes devolver tal cual
+    """
+    params = dict(request.query_params)
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    logger.info("GET /webhook — mode=%s token=%s challenge=%s", mode, token, challenge)
+
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        logger.info("✅ Webhook verificado correctamente")
+        return challenge or ""
+
+    logger.warning("❌ Verificación fallida — token recibido: '%s', esperado: '%s'", token, VERIFY_TOKEN)
+    raise HTTPException(status_code=403, detail="Verify token no coincide")
+
+
+# ---------------------------------------------------------------------------
+# POST /webhook — Recepción de mensajes
+# ---------------------------------------------------------------------------
 
 @app.post("/webhook")
-async def recibir(request: Request):
-    data = await request.json()
+async def recibir_webhook(request: Request, background_tasks: BackgroundTasks) -> Response:
+    """
+    Meta envía aquí todos los eventos: mensajes entrantes, estados de entrega,
+    reacciones, etc.
+
+    IMPORTANTE: Meta requiere respuesta HTTP 200 en menos de 20 segundos.
+    Si no la recibe, reintentará el envío varias veces.
+    Por eso procesamos en BackgroundTask y respondemos 200 inmediatamente.
+    """
+    body_bytes = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+
+    # Validar firma HMAC si APP_SECRET está configurado
+    if VALIDAR_FIRMA and APP_SECRET:
+        if not validar_firma(body_bytes, signature, APP_SECRET):
+            logger.warning("❌ Firma HMAC inválida — posible payload no-Meta")
+            raise HTTPException(status_code=401, detail="Firma inválida")
+    elif VALIDAR_FIRMA and not APP_SECRET:
+        logger.warning("⚠️  VALIDAR_FIRMA=true pero WHATSAPP_APP_SECRET no está configurado — saltando validación")
+
     try:
-        # Navegamos el JSON de Meta para llegar al mensaje
-        messages = data.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("messages", [])
-        
-        if messages:
-            msg = messages[0]
-            numero = msg["from"]
-            
-            if msg.get("type") == "text":
-                texto_usuario = msg["text"]["body"]
-                logger.info(f"📩 Mensaje de {numero}: {texto_usuario}")
+        payload = json.loads(body_bytes)
+    except json.JSONDecodeError:
+        logger.error("❌ Payload no es JSON válido")
+        raise HTTPException(status_code=400, detail="JSON inválido")
 
-                # --- AQUÍ CONECTAS CON TU OTRO ARCHIVO ---
-                # No importa si es OpenAI, Claude o un script propio.
-                respuesta_ia = await procesar_mensaje(texto_usuario)
+    # Responder 200 inmediatamente y procesar en background
+    background_tasks.add_task(_procesar_payload, payload)
+    return Response(status_code=200)
 
-                # Enviar respuesta de vuelta
-                await gw.enviar_texto(numero, respuesta_ia)
-                logger.info(f"📤 Respuesta enviada.")
 
-        return {"status": "ok"}
-    except Exception as e:
-        logger.error(f"🔥 Error: {e}")
-        return {"status": "error"}
+# ---------------------------------------------------------------------------
+# Procesamiento en background
+# ---------------------------------------------------------------------------
+
+def _procesar_payload(payload: dict) -> None:
+    """Parsea y loggea todos los eventos del payload."""
+    logger.debug("Payload completo:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
+
+    eventos = parsear_payload(payload)
+
+    if not eventos:
+        logger.info("Payload sin eventos reconocibles (¿notificación de sistema?)")
+        return
+
+    for evento in eventos:
+        # Deduplicar mensajes y eventos de estado por message_id
+        mid = _extraer_message_id(evento)
+        if mid and mid in _mensajes_vistos:
+            logger.debug("Duplicado ignorado — message_id=%s", mid[:20])
+            continue
+        if mid:
+            _mensajes_vistos.append(mid)
+
+        loggear_evento(evento)
+        _historial.append({
+            "ts": datetime.utcnow().isoformat(),
+            "tipo": type(evento).__name__,
+            "evento": _evento_a_dict(evento),
+        })
+
+
+def _extraer_message_id(evento) -> str | None:
+    if isinstance(evento, (MensajeTexto, MensajeInteractivo)):
+        return evento.message_id
+    if isinstance(evento, ActualizacionEstado):
+        return f"status:{evento.message_id}:{evento.estado}"
+    return None
+
+
+def _evento_a_dict(evento) -> dict:
+    if isinstance(evento, EventoDesconocido):
+        return {"tipo": evento.tipo, "raw": evento.payload_raw}
+    return evento.__dict__
+
+
+# ---------------------------------------------------------------------------
+# GET /historial — Consultar eventos recibidos (solo para debugging)
+# ---------------------------------------------------------------------------
+
+@app.get("/historial")
+async def ver_historial(limit: int = 20) -> dict:
+    """
+    Devuelve los últimos N eventos recibidos.
+    Solo para validación — no exponer en producción.
+    """
+    return {
+        "total": len(_historial),
+        "ultimos": _historial[-limit:],
+    }
+
+
+@app.get("/health")
+async def health() -> dict:
+    return {"status": "ok", "mensajes_procesados": len(_historial)}
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
