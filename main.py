@@ -120,7 +120,7 @@ def _reenviar_payload(payload: dict) -> None:
     try:
         headers = {"Content-Type": "application/json"}
         # Se envía por POST con json=payload para preservar la estructura
-        response = requests.post(FORWARD_URL, json=payload, headers=headers, timeout=10)
+        response = requests.post(FORWARD_URL, json=payload, headers=headers, timeout=60)
         response.raise_for_status()
         logger.info("🚀 Payload reenviado a Genesis exitosamente (Status: %s)", response.status_code)
     except requests.exceptions.RequestException as e:
